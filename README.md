@@ -11,17 +11,16 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 
 ## Secrets e variáveis do GitHub Actions
 
-| Nome                | Tipo     | Uso                                                        |
-| ------------------- | -------- | ---------------------------------------------------------- |
-| `GITOPS_TOKEN`      | secret   | PAT/deploy key com escrita apenas em `canary-demo-gitops`  |
-| `ARGOCD_SERVER`     | secret   | host:porta do Argo CD                                      |
-| `ARGOCD_AUTH_TOKEN` | secret   | token da role `ci` do AppProject (sem admin)               |
-| `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`) |
-| `STABLE_VERSION`    | variável | versão estável atual; atualizar após cada promoção         |
+| Nome                | Tipo     | Uso                                                               |
+| ------------------- | -------- | ----------------------------------------------------------------- |
+| `GITOPS_TOKEN`      | secret   | PAT/deploy key com escrita apenas em `canary-demo-gitops`         |
+| `ARGOCD_SERVER`     | secret   | hostname do Argo CD, sem `https://` (ex.: `argo.diegovieira.app`) |
+| `ARGOCD_AUTH_TOKEN` | secret   | token da role `ci` do AppProject (sem admin)                      |
+| `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`)        |
+| `STABLE_VERSION`    | variável | versão estável atual; atualizar após cada promoção                |
 
-O job `smoke-test` usa um runner `self-hosted` com label `lab`, com acesso de rede ao cluster e à CLI `argocd`.
-O job `deploy-with-argocd` roda em runner hospedado e exige que o Argo CD seja alcançável pela Internet;
-para Argo CD privado, mova-o também para o runner `lab`.
+Os jobs `deploy-with-argocd` e `smoke-test` usam runners hospedados pelo GitHub. O Argo CD e o
+endpoint de smoke test precisam estar acessíveis publicamente.
 
 ## Pendências antes do primeiro uso
 
