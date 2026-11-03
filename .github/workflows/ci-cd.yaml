@@ -133,7 +133,7 @@ jobs:
 
   deploy-with-argocd:
     needs: [build, update-gitops]
-    runs-on: [self-hosted, lab]
+    runs-on: ubuntu-latest
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -164,7 +164,7 @@ jobs:
 
   smoke-test:
     needs: [build, deploy-with-argocd]
-    runs-on: [self-hosted, lab]
+    runs-on: ubuntu-latest
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
