@@ -4,6 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      canary_weight:
+        description: Peso (%) do canary no primeiro passo do rollout
+        type: string
+        required: false
+        default: '50'
 
 permissions:
   contents: read
@@ -13,6 +20,7 @@ env:
   ARGOCD_VERSION: v2.9.7
   ARGOCD_APP: app-canary
   ARGOCD_ROLLOUT: app-canary
+  CANARY_WEIGHT: ${{ inputs.canary_weight || '50' }}
 
 jobs:
   lint:
@@ -83,7 +91,7 @@ jobs:
           artifact-name: sbom.spdx.json
 
   publish-image:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [build, security-scan]
     runs-on: ubuntu-latest
     permissions:
@@ -116,13 +124,25 @@ jobs:
           repository: validation-projects/argo-gitops-repo
           token: ${{ secrets.GH_TOKEN }}
           ref: main
-      - name: Instalar kustomize
+      - name: Instalar kustomize e yq
         run: |
           curl -sSfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+          curl -sSfL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
       - name: Atualizar imagem
         working-directory: clusters/lab/app-canary
         run: |
           kustomize edit set image canary-demo=${IMAGE}@${{ needs.publish-image.outputs.digest }}
+          kustomize build . > /dev/null
+      - name: Atualizar peso do canary
+        working-directory: clusters/lab/app-canary
+        run: |
+          if ! [[ "$CANARY_WEIGHT" =~ ^[0-9]+$ ]] || (( CANARY_WEIGHT < 1 || CANARY_WEIGHT > 99 )); then
+            echo "::error::canary_weight deve ser um inteiro entre 1 e 99 (recebido: '$CANARY_WEIGHT')"
+            exit 1
+          fi
+          yq -i '.spec.strategy.canary.steps[0].setWeight = env(CANARY_WEIGHT)' rollout.yaml
+          yq '.spec.strategy.canary.steps' rollout.yaml
           kustomize build . > /dev/null
       - name: Commit e push
         run: |
@@ -149,13 +169,13 @@ jobs:
           argocd app get "app-canary" --grpc-web --refresh
           argocd app sync "app-canary" --grpc-web
           argocd app wait "app-canary" --grpc-web --sync --timeout 300
-      - name: Aguardar rollout pausar em 50%
+      - name: Aguardar rollout pausar em ${{ env.CANARY_WEIGHT }}%
         run: |
           for i in $(seq 1 60); do
             phase=$(argocd app get "app-canary" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
-            echo "Rollout: $phase"
+            echo "Rollout (aguardando pausa em ${CANARY_WEIGHT}%): $phase"
             case "$phase" in
-              Paused) exit 0 ;;
+              Paused|Suspended) exit 0 ;;
               Degraded) echo "Rollout degradado"; exit 1 ;;
             esac
             sleep 5
@@ -179,7 +199,7 @@ jobs:
           chmod +x argocd
           sudo install -m 555 argocd /usr/local/bin/argocd
       - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-      - name: Validar proporção 50/50
+      - name: Validar proporção canary ${{ env.CANARY_WEIGHT }}%
         id: ratio
         env:
           SMOKE_URL: ${{ secrets.SMOKE_URL }}
@@ -187,6 +207,7 @@ jobs:
           SMOKE_INSECURE: 'false'
           CANARY_VERSION: ${{ needs.build.outputs.version }}
           STABLE_VERSION: ${{ vars.STABLE_VERSION }}
+          CANARY_WEIGHT: ${{ env.CANARY_WEIGHT }}
         run: node scripts/smoke-ratio.js
       - name: Promover
         if: success()
