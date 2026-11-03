@@ -1,0 +1,192 @@
+name: ci-cd
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/canary-demo
+  ARGOCD_VERSION: v2.13.2
+  ARGOCD_APP: canary-demo
+  ARGOCD_ROLLOUT: canary-demo
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+          build-args: APP_VERSION=${{ steps.v.outputs.version }}
+          outputs: type=docker,dest=/tmp/image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  security-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
+      - run: docker load -i /tmp/image.tar
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ needs.build.outputs.version }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ needs.build.outputs.version }}
+          artifact-name: sbom.spdx.json
+
+  publish-image:
+    if: github.event_name == 'push'
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.build.outputs.version }}
+          build-args: APP_VERSION=${{ needs.build.outputs.version }}
+
+  update-gitops:
+    needs: [build, publish-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/canary-demo-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+      - name: Instalar kustomize
+        run: |
+          curl -sSfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+      - name: Atualizar imagem
+        working-directory: clusters/lab/app-canary
+        run: |
+          kustomize edit set image canary-demo=${IMAGE}@${{ needs.publish-image.outputs.digest }}
+          kustomize build . > /dev/null
+      - name: Commit e push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git commit -am "deploy canary-demo ${{ needs.build.outputs.version }} (${{ github.repository }}@${{ github.sha }})"
+          git push origin HEAD:main
+
+  deploy-with-argocd:
+    needs: [build, update-gitops]
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      - name: Instalar Argo CD CLI
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Sincronizar
+        run: |
+          argocd app get "$ARGOCD_APP" --grpc-web --refresh
+          argocd app sync "$ARGOCD_APP" --grpc-web
+          argocd app wait "$ARGOCD_APP" --grpc-web --sync --timeout 300
+      - name: Aguardar rollout pausar em 50%
+        run: |
+          for i in $(seq 1 60); do
+            phase=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
+            echo "Rollout: $phase"
+            case "$phase" in
+              Paused) exit 0 ;;
+              Degraded) echo "Rollout degradado"; exit 1 ;;
+            esac
+            sleep 5
+          done
+          echo "Timeout aguardando pausa"; exit 1
+
+  smoke-test:
+    needs: [build, deploy-with-argocd]
+    runs-on: [self-hosted, lab]
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validar proporção 50/50
+        id: ratio
+        env:
+          SMOKE_URL: ${{ secrets.SMOKE_URL }}
+          SMOKE_HOST: app.canary.lab
+          SMOKE_INSECURE: 'true'
+          CANARY_VERSION: ${{ needs.build.outputs.version }}
+          STABLE_VERSION: ${{ vars.STABLE_VERSION }}
+        run: node scripts/smoke-ratio.js
+      - name: Promover
+        if: success()
+        run: |
+          argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
+      - name: Abortar
+        if: failure() && steps.ratio.outcome == 'failure'
+        run: |
+          argocd app actions run "$ARGOCD_APP" abort --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web

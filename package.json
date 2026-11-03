@@ -1,0 +1,23 @@
+{
+  "name": "canary-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aplicação de teste para deployment canary",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "smoke": "node scripts/smoke-ratio.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "globals": "^15.0.0",
+    "prettier": "^3.0.0"
+  }
+}
