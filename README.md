@@ -19,9 +19,8 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 | `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`) |
 | `STABLE_VERSION`    | variável | versão estável atual; atualizar após cada promoção         |
 
-O job `smoke-test` usa um runner `self-hosted` com label `lab`, com acesso de rede ao cluster e à CLI `argocd`.
-O job `deploy-with-argocd` roda em runner hospedado e exige que o Argo CD seja alcançável pela Internet;
-para Argo CD privado, mova-o também para o runner `lab`.
+Os jobs `deploy-with-argocd` e `smoke-test` usam um runner `self-hosted` com label `lab`, com acesso
+de rede ao Argo CD e ao cluster.
 
 ## Pendências antes do primeiro uso
 
