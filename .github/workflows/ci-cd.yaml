@@ -18,8 +18,8 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/canary-demo
   ARGOCD_VERSION: v2.9.7
-  ARGOCD_APP: app-canary
-  ARGOCD_ROLLOUT: app-canary
+  ARGOCD_APP: canary-demo
+  ARGOCD_ROLLOUT: canary-demo
   CANARY_WEIGHT: ${{ inputs.canary_weight || '50' }}
 
 jobs:
@@ -166,13 +166,13 @@ jobs:
       - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
       - name: Sincronizar
         run: |
-          argocd app get "app-canary" --grpc-web --refresh
-          argocd app sync "app-canary" --grpc-web
-          argocd app wait "app-canary" --grpc-web --sync --timeout 300
+          argocd app get "$ARGOCD_APP" --grpc-web --refresh
+          argocd app sync "$ARGOCD_APP" --grpc-web
+          argocd app wait "$ARGOCD_APP" --grpc-web --sync --timeout 300
       - name: Aguardar rollout pausar em ${{ env.CANARY_WEIGHT }}%
         run: |
           for i in $(seq 1 60); do
-            phase=$(argocd app get "app-canary" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
+            phase=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
             echo "Rollout (aguardando pausa em ${CANARY_WEIGHT}%): $phase"
             case "$phase" in
               Paused|Suspended) exit 0 ;;
@@ -212,8 +212,8 @@ jobs:
       - name: Promover
         if: success()
         run: |
-          argocd app actions run "app-canary" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
-          argocd app wait "app-canary" --grpc-web --health --timeout 300
+          argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
       - name: Abortar
         if: failure() && steps.ratio.outcome == 'failure'
         run: |
