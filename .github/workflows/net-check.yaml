@@ -1,0 +1,17 @@
+name: net-check
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: DNS
+        run: dig +short ingress.diegovieira.app
+      - name: Porta 443
+        run: nc -zvw5 ingress.diegovieira.app 443 || true
+      - name: HTTPS
+        run: curl -vkI --max-time 15 https://ingress.diegovieira.app/ || true

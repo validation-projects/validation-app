@@ -164,7 +164,7 @@ jobs:
 
   smoke-test:
     needs: [build, deploy-with-argocd]
-    runs-on: [self-hosted, lab]
+    runs-on: ubuntu-latest
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -173,12 +173,18 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - name: Instalar Argo CD CLI
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
       - name: Validar proporção 50/50
         id: ratio
         env:
           SMOKE_URL: ${{ secrets.SMOKE_URL }}
-          SMOKE_HOST: app.canary.lab
-          SMOKE_INSECURE: 'true'
+          SMOKE_HOST: ${{ secrets.SMOKE_HOST }}
+          SMOKE_INSECURE: 'false'
           CANARY_VERSION: ${{ needs.build.outputs.version }}
           STABLE_VERSION: ${{ vars.STABLE_VERSION }}
         run: node scripts/smoke-ratio.js
