@@ -13,7 +13,7 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 
 | Nome                | Tipo     | Uso                                                               |
 | ------------------- | -------- | ----------------------------------------------------------------- |
-| `GITOPS_TOKEN`      | secret   | PAT/deploy key com escrita apenas em `canary-demo-gitops`         |
+| `GITOPS_TOKEN`      | secret   | PAT/deploy key com escrita apenas em `canary-demo-gitops`.         |
 | `ARGOCD_SERVER`     | secret   | hostname do Argo CD, sem `https://` (ex.: `argo.diegovieira.app`) |
 | `ARGOCD_AUTH_TOKEN` | secret   | token da role `ci` do AppProject (sem admin)                      |
 | `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`)        |
