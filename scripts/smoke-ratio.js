@@ -39,7 +39,13 @@ function get() {
       { agent, headers, rejectUnauthorized: !insecure, servername: process.env.SMOKE_HOST },
       (res) => {
         res.resume();
-        res.on('end', () => resolve({ status: res.statusCode, version: res.headers['x-app-version'] }));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode,
+            version: res.headers['x-app-version'],
+            server: res.headers.server,
+          }),
+        );
       },
     );
     req.setTimeout(5000, () => req.destroy(new Error('timeout')));
@@ -50,22 +56,45 @@ function get() {
 
 (async () => {
   const counts = {};
+  const statuses = {};
+  const servers = new Set();
   let errors = 0;
+  let missing = 0;
+  let lastError;
   for (let i = 0; i < total; i++) {
     try {
       const r = await get();
+      statuses[r.status] = (statuses[r.status] ?? 0) + 1;
+      if (r.server) servers.add(r.server);
       if (r.status !== 200) errors++;
+      else if (r.version === undefined) missing++;
       else counts[r.version] = (counts[r.version] ?? 0) + 1;
-    } catch {
+    } catch (err) {
       errors++;
+      lastError = err.message;
     }
   }
   const ok = (counts[stable] ?? 0) + (counts[canary] ?? 0);
   const ratio = ok ? (counts[canary] ?? 0) / ok : 0;
   console.log(
-    JSON.stringify({ total, errors, counts, expected, min, max, canaryRatio: Number(ratio.toFixed(3)) }),
+    JSON.stringify({
+      total,
+      errors,
+      missing,
+      counts,
+      statuses,
+      servers: [...servers],
+      expected,
+      min,
+      max,
+      canaryRatio: Number(ratio.toFixed(3)),
+    }),
   );
-  if (errors > 0 || ratio < min || ratio > max) {
+  if (lastError) console.error(`Último erro de conexão: ${lastError}`);
+  if (missing > 0) {
+    console.error(`${missing} respostas 200 sem X-App-Version: SMOKE_URL/SMOKE_HOST não apontam para o app`);
+  }
+  if (errors > 0 || missing > 0 || ratio < min || ratio > max) {
     console.error(
       `Falha: proporção canary ${ratio.toFixed(3)} fora de [${min}, ${max}] ou houve ${errors} erros`,
     );
