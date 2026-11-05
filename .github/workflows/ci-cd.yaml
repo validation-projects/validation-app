@@ -307,7 +307,7 @@ jobs:
           wait-timer: ${{ env.WAIT_TIME }}
           default-action: cancel
           environment: canary-approval
-          user-token: ${{ secrets.APPROVER_PAT }}
+          user-token: ${{ secrets.GH_TOKEN }}
 
   promote:
     name: Promover release
