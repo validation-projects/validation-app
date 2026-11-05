@@ -303,7 +303,16 @@ jobs:
         if: ${{ !failure() }}
         run: |
           argocd app actions run "$ARGOCD_APP" abort --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
-          argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
+          # An aborted Rollout stays Degraded (RolloutAborted) with 100% of the traffic on the stable version.
+          for i in $(seq 1 60); do
+            health=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | "\(.health.status)|\(.health.message // "")"')
+            echo "Rollout: $health"
+            case "$health" in
+              Healthy\|*|Degraded\|*[Aa]bort*) exit 0 ;;
+            esac
+            sleep 5
+          done
+          echo "Timeout aguardando a restauração da versão anterior"; exit 1
       - name: Resumo do rollback
         if: always()
         env:
