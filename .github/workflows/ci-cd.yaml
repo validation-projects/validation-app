@@ -11,6 +11,11 @@ on:
         type: string
         required: false
         default: '50'
+      wait_time:
+        description: Tempo em minutos aguardando aprovação para promover o deploy
+        type: string
+        required: false
+        default: '30'
 
 permissions:
   contents: read
@@ -21,6 +26,7 @@ env:
   ARGOCD_APP: canary-demo
   ARGOCD_ROLLOUT: canary-demo
   CANARY_WEIGHT: ${{ inputs.canary_weight || '50' }}
+  WAIT_TIME: ${{ inputs.wait_time || '30' }}
 
 jobs:
   lint:
@@ -152,18 +158,20 @@ jobs:
           git push origin HEAD:main
 
   deploy-with-argocd:
+    name: Deploy canary
     needs: [build, update-gitops]
     runs-on: ubuntu-latest
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
-      - name: Instalar Argo CD CLI
+      - name: Instalar CLI de deploy
         run: |
           curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
           chmod +x argocd
           sudo install -m 555 argocd /usr/local/bin/argocd
-      - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Mascarar credenciais
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
       - name: Sincronizar
         run: |
           argocd app get "$ARGOCD_APP" --grpc-web --refresh
@@ -183,23 +191,15 @@ jobs:
           echo "Timeout aguardando pausa"; exit 1
 
   smoke-test:
-    needs: [build, deploy-with-argocd]
+    name: Validação canary
+    needs: [build, publish-image, deploy-with-argocd]
     runs-on: ubuntu-latest
-    env:
-      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - name: Instalar Argo CD CLI
-        run: |
-          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
-          chmod +x argocd
-          sudo install -m 555 argocd /usr/local/bin/argocd
-      - run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-      - name: Validar proporção canary ${{ env.CANARY_WEIGHT }}%
+      - name: Validar distribuição de tráfego
         id: ratio
         env:
           SMOKE_URL: ${{ secrets.SMOKE_URL }}
@@ -209,12 +209,138 @@ jobs:
           STABLE_VERSION: ${{ vars.STABLE_VERSION }}
           CANARY_WEIGHT: ${{ env.CANARY_WEIGHT }}
         run: node scripts/smoke-ratio.js
-      - name: Promover
-        if: success()
+      - name: Resumo da validação
+        if: always()
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+          RATIO_OUTCOME: ${{ steps.ratio.outcome }}
+        run: |
+          case "$RATIO_OUTCOME" in
+            success) result="Aprovada" ;;
+            failure) result="Reprovada" ;;
+            *) result="Não executada ($RATIO_OUTCOME)" ;;
+          esac
+          {
+            echo "## Validação canary"
+            echo ""
+            echo "| Item | Valor |"
+            echo "| --- | --- |"
+            echo "| Versão | \`$VERSION\` |"
+            echo "| Digest | \`$DIGEST\` |"
+            echo "| Peso canary | ${CANARY_WEIGHT}% |"
+            echo "| Validação de tráfego | $result |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approval-timer:
+    name: Aguardar aprovação
+    needs: [smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    outputs:
+      result: ${{ steps.approval.outputs.result }}
+    steps:
+      - name: Aguardar aprovação por até ${{ env.WAIT_TIME }} minutos
+        uses: validation-projects/actions-manual-approval@v2
+        id: approval
+        with:
+          wait-timer: ${{ env.WAIT_TIME }}
+          default-action: cancel
+          environment: canary-approval
+          user-token: ${{ secrets.APPROVER_PAT }}
+
+  promote:
+    name: Promover release
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    environment: canary-approval
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Promover release
         run: |
           argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
           argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
-      - name: Abortar
-        if: failure() && steps.ratio.outcome == 'failure'
+      - name: Resumo da promoção
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            echo "## Promoção concluída"
+            echo ""
+            echo "Release \`$VERSION\` promovida para 100% do tráfego."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    name: Reverter deploy
+    needs: [build, smoke-test, approval-timer, promote]
+    if: always() && needs.smoke-test.result != 'skipped' && needs.promote.result != 'success'
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      # !failure() keeps the steps running when the run was cancelled by the approval timer.
+      - name: Instalar CLI de deploy
+        if: ${{ !failure() }}
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        if: ${{ !failure() }}
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Reverter para versão anterior
+        if: ${{ !failure() }}
         run: |
           argocd app actions run "$ARGOCD_APP" abort --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
+      - name: Resumo do rollback
+        if: always()
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+          APPROVAL_RESULT: ${{ needs.approval-timer.outputs.result }}
+          APPROVAL_JOB_RESULT: ${{ needs.approval-timer.result }}
+          PROMOTE_RESULT: ${{ needs.promote.result }}
+          ROLLBACK_OUTCOME: ${{ job.status }}
+        run: |
+          if [ "$SMOKE_RESULT" != "success" ]; then
+            reason="A validação de tráfego do canary falhou; a aprovação não foi solicitada."
+          else
+            case "$APPROVAL_RESULT" in
+              cancelled) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos." ;;
+              rejected) reason="O deploy foi rejeitado por um revisor." ;;
+              approved|auto-approved) reason="O deploy foi aprovado, mas a promoção falhou." ;;
+              *) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos, foi rejeitado ou falhou." ;;
+            esac
+          fi
+          if [ "$ROLLBACK_OUTCOME" = "success" ]; then
+            restored="A versão anterior foi restaurada e a release \`$VERSION\` foi descartada."
+          else
+            restored="**Falha ao restaurar a versão anterior — verificação manual necessária.**"
+          fi
+          {
+            echo "## Deploy revertido"
+            echo ""
+            echo "$reason"
+            echo ""
+            echo "$restored"
+            echo ""
+            echo "| Item | Valor |"
+            echo "| --- | --- |"
+            echo "| Versão | \`$VERSION\` |"
+            echo "| Validação canary | ${SMOKE_RESULT} |"
+            echo "| Resultado da aprovação | ${APPROVAL_RESULT:-n/a} (job: ${APPROVAL_JOB_RESULT}) |"
+            echo "| Promoção | ${PROMOTE_RESULT} |"
+            echo "| Tempo de espera | ${WAIT_TIME} min |"
+          } >> "$GITHUB_STEP_SUMMARY"
