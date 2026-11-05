@@ -32,6 +32,7 @@ env:
   ARGOCD_ROLLOUT: canary-demo
   CANARY_WEIGHT: ${{ inputs.canary_weight || '50' }}
   WAIT_TIME: ${{ inputs.wait_time || '30' }}
+  SMOKE_INSECURE: ${{ vars.SMOKE_INSECURE || 'false' }}
 
 jobs:
   lint:
@@ -179,14 +180,27 @@ jobs:
           STABLE_VERSION_VAR: ${{ vars.STABLE_VERSION }}
           SMOKE_URL: ${{ secrets.SMOKE_URL }}
           SMOKE_HOST: ${{ secrets.SMOKE_HOST }}
+          SMOKE_INSECURE: ${{ env.SMOKE_INSECURE }}
         run: |
           version="$STABLE_VERSION_INPUT"
           source="input stable_version"
           if [ -z "$version" ]; then
             # Before the sync all traffic is served by the stable version.
             args=(-sS -m 5 -o /dev/null -D -)
-            [ -n "$SMOKE_HOST" ] && args+=(-H "Host: $SMOKE_HOST")
-            seen=$(for i in $(seq 1 20); do curl "${args[@]}" "$SMOKE_URL" || true; done |
+            url="$SMOKE_URL"
+            if [ -n "$SMOKE_HOST" ]; then
+              # Same Host header and TLS SNI as smoke-ratio.js.
+              authority=$(sed -E 's#^[a-z]+://([^/]+).*#\1#' <<<"$SMOKE_URL")
+              host=${authority%:*}
+              port=${authority##*:}
+              if [ "$port" = "$authority" ]; then
+                case "$SMOKE_URL" in https://*) port=443 ;; *) port=80 ;; esac
+              fi
+              url=$(sed -E "s#^([a-z]+://)[^/]+#\1$SMOKE_HOST:$port#" <<<"$SMOKE_URL")
+              args+=(--connect-to "$SMOKE_HOST:$port:$host:$port")
+            fi
+            [ "$SMOKE_INSECURE" = true ] && args+=(-k)
+            seen=$(for i in $(seq 1 20); do curl "${args[@]}" "$url" || true; done |
               tr -d '\r' | awk -F': ' 'tolower($1) == "x-app-version" { print $2 }' | sort -u)
             if [ "$(echo "$seen" | grep -c .)" = 1 ]; then
               version="$seen"
@@ -244,7 +258,7 @@ jobs:
         env:
           SMOKE_URL: ${{ secrets.SMOKE_URL }}
           SMOKE_HOST: ${{ secrets.SMOKE_HOST }}
-          SMOKE_INSECURE: 'false'
+          SMOKE_INSECURE: ${{ env.SMOKE_INSECURE }}
           CANARY_VERSION: ${{ needs.build.outputs.version }}
           STABLE_VERSION: ${{ needs.deploy-with-argocd.outputs.stable_version }}
           CANARY_WEIGHT: ${{ env.CANARY_WEIGHT }}
