@@ -16,6 +16,11 @@ on:
         type: string
         required: false
         default: '30'
+      stable_version:
+        description: Versão estável atual (vazio = detectar pela versão servida antes do deploy)
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -161,10 +166,45 @@ jobs:
     name: Deploy canary
     needs: [build, update-gitops]
     runs-on: ubuntu-latest
+    outputs:
+      stable_version: ${{ steps.stable.outputs.version }}
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
+      - name: Identificar versão estável
+        id: stable
+        env:
+          STABLE_VERSION_INPUT: ${{ inputs.stable_version }}
+          STABLE_VERSION_VAR: ${{ vars.STABLE_VERSION }}
+          SMOKE_URL: ${{ secrets.SMOKE_URL }}
+          SMOKE_HOST: ${{ secrets.SMOKE_HOST }}
+        run: |
+          version="$STABLE_VERSION_INPUT"
+          source="input stable_version"
+          if [ -z "$version" ]; then
+            # Before the sync all traffic is served by the stable version.
+            args=(-sS -m 5 -o /dev/null -D -)
+            [ -n "$SMOKE_HOST" ] && args+=(-H "Host: $SMOKE_HOST")
+            seen=$(for i in $(seq 1 20); do curl "${args[@]}" "$SMOKE_URL" || true; done |
+              tr -d '\r' | awk -F': ' 'tolower($1) == "x-app-version" { print $2 }' | sort -u)
+            if [ "$(echo "$seen" | grep -c .)" = 1 ]; then
+              version="$seen"
+              source="versão servida antes do deploy"
+            else
+              echo "::warning::Não foi possível detectar uma única versão em produção (respostas: $(echo $seen))"
+            fi
+          fi
+          if [ -z "$version" ] && [ -n "$STABLE_VERSION_VAR" ]; then
+            version="$STABLE_VERSION_VAR"
+            source="variável STABLE_VERSION"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::Versão estável desconhecida: informe o input stable_version"
+            exit 1
+          fi
+          echo "Versão estável: $version ($source)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Instalar CLI de deploy
         run: |
           curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
@@ -206,7 +246,7 @@ jobs:
           SMOKE_HOST: ${{ secrets.SMOKE_HOST }}
           SMOKE_INSECURE: 'false'
           CANARY_VERSION: ${{ needs.build.outputs.version }}
-          STABLE_VERSION: ${{ vars.STABLE_VERSION }}
+          STABLE_VERSION: ${{ needs.deploy-with-argocd.outputs.stable_version }}
           CANARY_WEIGHT: ${{ env.CANARY_WEIGHT }}
         run: node scripts/smoke-ratio.js
       - name: Resumo da validação
@@ -214,6 +254,7 @@ jobs:
         env:
           VERSION: ${{ needs.build.outputs.version }}
           DIGEST: ${{ needs.publish-image.outputs.digest }}
+          STABLE_VERSION: ${{ needs.deploy-with-argocd.outputs.stable_version }}
           RATIO_OUTCOME: ${{ steps.ratio.outcome }}
         run: |
           case "$RATIO_OUTCOME" in
@@ -228,6 +269,7 @@ jobs:
             echo "| --- | --- |"
             echo "| Versão | \`$VERSION\` |"
             echo "| Digest | \`$DIGEST\` |"
+            echo "| Versão estável | \`$STABLE_VERSION\` |"
             echo "| Peso canary | ${CANARY_WEIGHT}% |"
             echo "| Validação de tráfego | $result |"
           } >> "$GITHUB_STEP_SUMMARY"

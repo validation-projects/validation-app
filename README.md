@@ -17,7 +17,7 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 | `ARGOCD_SERVER`     | secret   | hostname do Argo CD, sem `https://` (ex.: `argo.diegovieira.app`) |
 | `ARGOCD_AUTH_TOKEN` | secret   | token da role `ci` do AppProject (sem admin)                      |
 | `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`)        |
-| `STABLE_VERSION`    | variável | versão estável atual; atualizar após cada promoção                |
+| `STABLE_VERSION`    | variável | opcional: fallback se a versão servida não puder ser detectada    |
 
 Os jobs `deploy-with-argocd` e `smoke-test` usam runners hospedados pelo GitHub. O Argo CD e o
 endpoint de smoke test precisam estar acessíveis publicamente.
@@ -26,4 +26,5 @@ endpoint de smoke test precisam estar acessíveis publicamente.
 
 - Substituir `OWNER` pelo usuário/organização (neste repositório e no GitOps).
 - Fixar as actions por SHA conforme a política de segurança.
-- Garantir que `STABLE_VERSION` aponte para a versão realmente estável antes de cada deploy.
+- A versão estável é, em ordem: o input `stable_version` do `workflow_dispatch`, a versão servida
+  (`X-App-Version` em `SMOKE_URL`) antes do sync, ou a variável `STABLE_VERSION`.
