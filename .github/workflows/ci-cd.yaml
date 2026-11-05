@@ -200,13 +200,16 @@ jobs:
               args+=(--connect-to "$SMOKE_HOST:$port:$host:$port")
             fi
             [ "$SMOKE_INSECURE" = true ] && args+=(-k)
-            seen=$(for i in $(seq 1 20); do curl "${args[@]}" "$url" || true; done |
-              tr -d '\r' | awk -F': ' 'tolower($1) == "x-app-version" { print $2 }' | sort -u)
+            headers=$(for i in $(seq 1 20); do curl "${args[@]}" "$url" || true; done | tr -d '\r')
+            seen=$(awk -F': ' 'tolower($1) == "x-app-version" { print $2 }' <<<"$headers" | sort -u)
             if [ "$(echo "$seen" | grep -c .)" = 1 ]; then
               version="$seen"
               source="versão servida antes do deploy"
             else
               echo "::warning::Não foi possível detectar uma única versão em produção (respostas: $(echo $seen))"
+              echo "Status/server recebidos (sem X-App-Version a URL não aponta para o app):"
+              summary=$(grep -iE '^(HTTP/|server:|location:)' <<<"$headers" | sort | uniq -c || true)
+              echo "${summary:-  nenhuma resposta}"
             fi
           fi
           if [ -z "$version" ] && [ -n "$STABLE_VERSION_VAR" ]; then
