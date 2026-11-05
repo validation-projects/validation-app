@@ -17,7 +17,9 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 | `ARGOCD_SERVER`     | secret   | hostname do Argo CD, sem `https://` (ex.: `argo.diegovieira.app`) |
 | `ARGOCD_AUTH_TOKEN` | secret   | token da role `ci` do AppProject (sem admin)                      |
 | `SMOKE_URL`         | secret   | URL do Istio Ingress Gateway (ex.: `https://IP:NODEPORT/`)        |
+| `SMOKE_HOST`        | secret   | Host/SNI do gateway (ex.: `app.canary.lab`)                       |
 | `STABLE_VERSION`    | variável | opcional: fallback se a versão servida não puder ser detectada    |
+| `SMOKE_INSECURE`    | variável | `true` para aceitar o certificado self-signed do gateway          |
 
 Os jobs `deploy-with-argocd` e `smoke-test` usam runners hospedados pelo GitHub. O Argo CD e o
 endpoint de smoke test precisam estar acessíveis publicamente.
