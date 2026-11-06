@@ -22,7 +22,7 @@ docker build --build-arg APP_VERSION=1.0.0 -t canary-demo:local .
 | `SMOKE_INSECURE`    | variável | `true` para aceitar o certificado self-signed do gateway          |
 
 Os jobs `deploy-with-argocd` e `smoke-test` usam runners hospedados pelo GitHub. O Argo CD e o
-endpoint de smoke test precisam estar acessíveis publicamente.
+endpoint de smoke test precisam estar acessíveis publicament.
 
 ## Pendências antes do primeiro uso
 
