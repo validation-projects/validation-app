@@ -301,7 +301,7 @@ jobs:
       result: ${{ steps.approval.outputs.result }}
     steps:
       - name: Aguardar aprovação por até ${{ env.WAIT_TIME }} minutos
-        uses: validation-projects/actions-manual-approval@v2
+        uses: validation-projects/actions-manual-approval@v3
         id: approval
         with:
           wait-timer: ${{ env.WAIT_TIME }}
