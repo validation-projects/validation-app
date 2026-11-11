@@ -12,7 +12,7 @@ on:
         required: false
         default: '50'
       wait_time:
-        description: Tempo em minutos aguardando aprovação para promover o deploy
+        description: Tempo em minutos aguardando aprovação para promover o deploy (sem aprovação, o deploy é revertido)
         type: string
         required: false
         default: '30'
@@ -314,12 +314,64 @@ jobs:
             echo "| Validação de tráfego | $result |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  approval-wait:
+    name: Aguardar aprovação
+    needs: [smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPROVAL_ENVIRONMENT: canary-approval
+      PROMOTE_JOB: Promover release
+    steps:
+      # The Rollout stays paused until promote resumes it; without approval in WAIT_TIME the run is
+      # cancelled and rollback aborts the Rollout.
+      - name: Aguardar aprovação por até ${{ env.WAIT_TIME }} minutos
+        run: |
+          if ! [[ "$WAIT_TIME" =~ ^[0-9]+$ ]] || (( WAIT_TIME < 1 )); then
+            echo "::error::wait_time deve ser um inteiro positivo (recebido: '$WAIT_TIME')"
+            exit 1
+          fi
+          api="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          start=$(date +%s)
+          deadline=$(( start + WAIT_TIME * 60 ))
+          seen=false
+          while (( $(date +%s) < deadline )); do
+            pending=$(gh api "$api/pending_deployments" \
+              --jq "[.[] | select(.environment.name == \"$APPROVAL_ENVIRONMENT\")] | length")
+            promote=$(gh api "$api/jobs" \
+              --jq ".jobs[] | select(.name == \"$PROMOTE_JOB\") | \"\(.status) \(.conclusion // \"\")\"")
+            elapsed=$(( ($(date +%s) - start) / 60 ))
+            if (( pending > 0 )); then
+              seen=true
+              echo "Aguardando aprovação em $APPROVAL_ENVIRONMENT: ${elapsed}/${WAIT_TIME} min"
+            else
+              case "$promote" in
+                completed\ failure) decision="rejeitado" ;;
+                in_progress*|completed*) decision="aprovado" ;;
+                *) $seen && decision="aprovado" || decision="" ;;
+              esac
+              if [ -n "$decision" ]; then
+                echo "Deploy $decision após ${elapsed} min (promoção: $promote)"
+                echo "Deploy $decision após ${elapsed} de ${WAIT_TIME} minutos." >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Aguardando a promoção entrar em aprovação (promoção: ${promote:-desconhecido})"
+            fi
+            sleep 30
+          done
+          echo "Sem aprovação em ${WAIT_TIME} minutos; cancelando o deploy"
+          echo "Deploy não aprovado em ${WAIT_TIME} minutos; o run foi cancelado e o deploy será revertido." >> "$GITHUB_STEP_SUMMARY"
+          gh api -X POST "$api/cancel" > /dev/null
+          # Wait for the cancellation to reach this job.
+          sleep 300
+
   promote:
     name: Promover release
     needs: [build, smoke-test]
     runs-on: ubuntu-latest
     environment: canary-approval
-    timeout-minutes: ${{ fromJSON(inputs.wait_time || '30') }}
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -377,7 +429,7 @@ jobs:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
-      # !failure() keeps the steps running when the run was cancelled (e.g. promote timeout).
+      # !failure() keeps the steps running when the run was cancelled by approval-wait.
       - name: Instalar CLI de deploy
         if: ${{ !failure() }}
         run: |
@@ -436,7 +488,7 @@ jobs:
             reason="A validação de tráfego do canary falhou; a aprovação não foi solicitada."
           else
             case "$PROMOTE_RESULT" in
-              cancelled) reason="A promoção foi cancelada ou excedeu ${WAIT_TIME} minutos." ;;
+              cancelled) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos ou o run foi cancelado." ;;
               failure) reason="O deploy foi rejeitado por um revisor ou a promoção falhou." ;;
               *) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos, foi rejeitado ou falhou." ;;
             esac
