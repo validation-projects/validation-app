@@ -7,6 +7,7 @@ permissions:
 
 jobs:
   check:
+    name: Network check
     runs-on: ubuntu-latest
     steps:
       - name: DNS
