@@ -36,6 +36,7 @@ env:
 
 jobs:
   lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +49,7 @@ jobs:
       - run: npm run format
 
   test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -59,6 +61,7 @@ jobs:
       - run: npm test
 
   build:
+    name: Build
     needs: [lint, test]
     runs-on: ubuntu-latest
     outputs:
@@ -83,6 +86,7 @@ jobs:
           retention-days: 1
 
   security-scan:
+    name: Security scan
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -103,6 +107,7 @@ jobs:
           artifact-name: sbom.spdx.json
 
   publish-image:
+    name: Publish image
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [build, security-scan]
     runs-on: ubuntu-latest
@@ -128,6 +133,7 @@ jobs:
           build-args: APP_VERSION=${{ needs.build.outputs.version }}
 
   update-gitops:
+    name: Update GitOps manifests
     needs: [build, publish-image]
     runs-on: ubuntu-latest
     steps:
@@ -271,7 +277,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   smoke-test:
-    name: Validação canary
+    name: Canary validation
     needs: [build, publish-image, deploy-with-argocd]
     runs-on: ubuntu-latest
     steps:
@@ -315,7 +321,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   approval-wait:
-    name: Aguardar aprovação
+    name: Wait for approval
     needs: [smoke-test]
     runs-on: ubuntu-latest
     permissions:
@@ -323,7 +329,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       APPROVAL_ENVIRONMENT: canary-approval
-      PROMOTE_JOB: Promover release
+      PROMOTE_JOB: Promote release
     steps:
       # The Rollout stays paused until promote resumes it; without approval in WAIT_TIME the run is
       # cancelled and rollback aborts the Rollout.
@@ -368,7 +374,7 @@ jobs:
           sleep 300
 
   promote:
-    name: Promover release
+    name: Promote release
     needs: [build, smoke-test]
     runs-on: ubuntu-latest
     environment: canary-approval
@@ -421,7 +427,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   rollback:
-    name: Reverter deploy
+    name: Roll back deploy
     needs: [build, smoke-test, promote]
     if: always() && needs.smoke-test.result != 'skipped' && needs.promote.result != 'success'
     runs-on: ubuntu-latest
