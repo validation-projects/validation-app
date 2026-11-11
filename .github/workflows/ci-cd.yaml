@@ -246,6 +246,29 @@ jobs:
             sleep 5
           done
           echo "Timeout aguardando pausa"; exit 1
+      - name: Status do Rollout
+        if: always()
+        env:
+          STAGE: deploy canary
+        run: |
+          if ! app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json); then
+            echo "::warning::Não foi possível obter o status do Rollout"
+            exit 0
+          fi
+          rollout=$(jq -c '.status.resources[]? | select(.kind=="Rollout")' <<<"$app")
+          echo "Recurso Rollout:"
+          jq . <<<"$rollout"
+          {
+            echo "## Status do Rollout ($STAGE)"
+            echo ""
+            echo "| Nome | Sync | Health | Mensagem |"
+            echo "| --- | --- | --- | --- |"
+            if [ -z "$rollout" ]; then
+              echo "| - | - | - | Nenhum Rollout encontrado |"
+            else
+              jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   smoke-test:
     name: Validação canary
@@ -291,29 +314,12 @@ jobs:
             echo "| Validação de tráfego | $result |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  approval-timer:
-    name: Aguardar aprovação
-    needs: [smoke-test]
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    outputs:
-      result: ${{ steps.approval.outputs.result }}
-    steps:
-      - name: Aguardar aprovação por até ${{ env.WAIT_TIME }} minutos
-        uses: validation-projects/actions-manual-approval@v3
-        id: approval
-        with:
-          wait-timer: ${{ env.WAIT_TIME }}
-          default-action: cancel
-          environment: canary-approval
-          user-token: ${{ secrets.GH_TOKEN }}
-
   promote:
     name: Promover release
     needs: [build, smoke-test]
     runs-on: ubuntu-latest
     environment: canary-approval
+    timeout-minutes: ${{ fromJSON(inputs.wait_time || '30') }}
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -329,6 +335,29 @@ jobs:
         run: |
           argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
           argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
+      - name: Status do Rollout
+        if: always()
+        env:
+          STAGE: promoção
+        run: |
+          if ! app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json); then
+            echo "::warning::Não foi possível obter o status do Rollout"
+            exit 0
+          fi
+          rollout=$(jq -c '.status.resources[]? | select(.kind=="Rollout")' <<<"$app")
+          echo "Recurso Rollout:"
+          jq . <<<"$rollout"
+          {
+            echo "## Status do Rollout ($STAGE)"
+            echo ""
+            echo "| Nome | Sync | Health | Mensagem |"
+            echo "| --- | --- | --- | --- |"
+            if [ -z "$rollout" ]; then
+              echo "| - | - | - | Nenhum Rollout encontrado |"
+            else
+              jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Resumo da promoção
         env:
           VERSION: ${{ needs.build.outputs.version }}
@@ -341,14 +370,14 @@ jobs:
 
   rollback:
     name: Reverter deploy
-    needs: [build, smoke-test, approval-timer, promote]
+    needs: [build, smoke-test, promote]
     if: always() && needs.smoke-test.result != 'skipped' && needs.promote.result != 'success'
     runs-on: ubuntu-latest
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
-      # !failure() keeps the steps running when the run was cancelled by the approval timer.
+      # !failure() keeps the steps running when the run was cancelled (e.g. promote timeout).
       - name: Instalar CLI de deploy
         if: ${{ !failure() }}
         run: |
@@ -372,23 +401,43 @@ jobs:
             sleep 5
           done
           echo "Timeout aguardando a restauração da versão anterior"; exit 1
+      - name: Status do Rollout
+        if: always()
+        env:
+          STAGE: rollback
+        run: |
+          if ! app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json); then
+            echo "::warning::Não foi possível obter o status do Rollout"
+            exit 0
+          fi
+          rollout=$(jq -c '.status.resources[]? | select(.kind=="Rollout")' <<<"$app")
+          echo "Recurso Rollout:"
+          jq . <<<"$rollout"
+          {
+            echo "## Status do Rollout ($STAGE)"
+            echo ""
+            echo "| Nome | Sync | Health | Mensagem |"
+            echo "| --- | --- | --- | --- |"
+            if [ -z "$rollout" ]; then
+              echo "| - | - | - | Nenhum Rollout encontrado |"
+            else
+              jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Resumo do rollback
         if: always()
         env:
           VERSION: ${{ needs.build.outputs.version }}
           SMOKE_RESULT: ${{ needs.smoke-test.result }}
-          APPROVAL_RESULT: ${{ needs.approval-timer.outputs.result }}
-          APPROVAL_JOB_RESULT: ${{ needs.approval-timer.result }}
           PROMOTE_RESULT: ${{ needs.promote.result }}
           ROLLBACK_OUTCOME: ${{ job.status }}
         run: |
           if [ "$SMOKE_RESULT" != "success" ]; then
             reason="A validação de tráfego do canary falhou; a aprovação não foi solicitada."
           else
-            case "$APPROVAL_RESULT" in
-              cancelled) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos." ;;
-              rejected) reason="O deploy foi rejeitado por um revisor." ;;
-              approved|auto-approved) reason="O deploy foi aprovado, mas a promoção falhou." ;;
+            case "$PROMOTE_RESULT" in
+              cancelled) reason="A promoção foi cancelada ou excedeu ${WAIT_TIME} minutos." ;;
+              failure) reason="O deploy foi rejeitado por um revisor ou a promoção falhou." ;;
               *) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos, foi rejeitado ou falhou." ;;
             esac
           fi
@@ -408,7 +457,6 @@ jobs:
             echo "| --- | --- |"
             echo "| Versão | \`$VERSION\` |"
             echo "| Validação canary | ${SMOKE_RESULT} |"
-            echo "| Resultado da aprovação | ${APPROVAL_RESULT:-n/a} (job: ${APPROVAL_JOB_RESULT}) |"
             echo "| Promoção | ${PROMOTE_RESULT} |"
             echo "| Tempo de espera | ${WAIT_TIME} min |"
           } >> "$GITHUB_STEP_SUMMARY"
