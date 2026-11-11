@@ -12,7 +12,7 @@ on:
         required: false
         default: '50'
       wait_time:
-        description: Tempo em minutos aguardando aprovação para promover o deploy
+        description: Tempo em minutos que o canary fica pausado aguardando aprovação; ao expirar, a release é promovida automaticamente
         type: string
         required: false
         default: '30'
@@ -146,14 +146,19 @@ jobs:
         run: |
           kustomize edit set image canary-demo=${IMAGE}@${{ needs.publish-image.outputs.digest }}
           kustomize build . > /dev/null
-      - name: Atualizar peso do canary
+      - name: Atualizar peso e pausa do canary
         working-directory: clusters/lab/app-canary
         run: |
           if ! [[ "$CANARY_WEIGHT" =~ ^[0-9]+$ ]] || (( CANARY_WEIGHT < 1 || CANARY_WEIGHT > 99 )); then
             echo "::error::canary_weight deve ser um inteiro entre 1 e 99 (recebido: '$CANARY_WEIGHT')"
             exit 1
           fi
+          if ! [[ "$WAIT_TIME" =~ ^[0-9]+$ ]] || (( WAIT_TIME < 1 )); then
+            echo "::error::wait_time deve ser um inteiro positivo (recebido: '$WAIT_TIME')"
+            exit 1
+          fi
           yq -i '.spec.strategy.canary.steps[0].setWeight = env(CANARY_WEIGHT)' rollout.yaml
+          PAUSE_DURATION="${WAIT_TIME}m" yq -i '(.spec.strategy.canary.steps[] | select(has("pause")) | .pause) = {"duration": strenv(PAUSE_DURATION)}' rollout.yaml
           yq '.spec.strategy.canary.steps' rollout.yaml
           kustomize build . > /dev/null
       - name: Commit e push
@@ -314,12 +319,100 @@ jobs:
             echo "| Validação de tráfego | $result |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  auto-promote:
+    name: Aguardar promoção
+    needs: [smoke-test]
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      APPROVAL_ENVIRONMENT: canary-approval
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: |
+          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+          echo "::add-mask::$GH_TOKEN"
+      # The Rollout pause has duration WAIT_TIME: without approval the release is promoted when it expires.
+      - name: Aguardar promoção por até ${{ env.WAIT_TIME }} minutos
+        id: wait
+        run: |
+          start=$(date +%s)
+          deadline=$(( start + WAIT_TIME * 60 + 600 ))
+          while :; do
+            health=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | "\(.health.status)|\(.health.message // "")"') || health="Unknown|"
+            elapsed=$(( ($(date +%s) - start) / 60 ))
+            echo "Rollout (${elapsed}/${WAIT_TIME} min): $health"
+            case "$health" in
+              Healthy\|*) result=promoted; break ;;
+              Degraded\|*[Aa]bort*) result=aborted; break ;;
+              Degraded\|*) result=degraded; break ;;
+            esac
+            if (( $(date +%s) >= deadline )); then
+              result=timeout; break
+            fi
+            sleep 15
+          done
+          echo "Resultado: $result"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      # Resolves the pending promote job so the run does not stay waiting for approval.
+      - name: Concluir aprovação pendente
+        if: always() && steps.wait.outputs.result != 'aborted'
+        env:
+          RESULT: ${{ steps.wait.outputs.result }}
+        run: |
+          if [ "$RESULT" = promoted ]; then
+            state=approved
+            comment="Release promovida automaticamente ao fim da pausa de ${WAIT_TIME} minutos."
+          else
+            state=rejected
+            comment="Release não promovida (${RESULT:-erro}); deploy será revertido."
+          fi
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/pending_deployments" \
+            --jq "[.[] | select(.environment.name == \"$APPROVAL_ENVIRONMENT\") | .environment.id]")
+          if [ "$ids" = "[]" ]; then
+            echo "Nenhuma aprovação pendente em $APPROVAL_ENVIRONMENT"
+            exit 0
+          fi
+          jq -n --argjson ids "$ids" --arg state "$state" --arg comment "$comment" \
+            '{environment_ids: $ids, state: $state, comment: $comment}' |
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/pending_deployments" --input - > /dev/null
+          echo "Aprovação pendente em $APPROVAL_ENVIRONMENT: $state — $comment"
+          echo "$comment" >> "$GITHUB_STEP_SUMMARY"
+      - name: Status do Rollout
+        if: always()
+        env:
+          STAGE: aguardando promoção
+        run: |
+          if ! app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json); then
+            echo "::warning::Não foi possível obter o status do Rollout"
+            exit 0
+          fi
+          rollout=$(jq -c '.status.resources[]? | select(.kind=="Rollout")' <<<"$app")
+          echo "Recurso Rollout:"
+          jq . <<<"$rollout"
+          {
+            echo "## Status do Rollout ($STAGE)"
+            echo ""
+            echo "| Nome | Sync | Health | Mensagem |"
+            echo "| --- | --- | --- | --- |"
+            if [ -z "$rollout" ]; then
+              echo "| - | - | - | Nenhum Rollout encontrado |"
+            else
+              jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   promote:
     name: Promover release
     needs: [build, smoke-test]
     runs-on: ubuntu-latest
     environment: canary-approval
-    timeout-minutes: ${{ fromJSON(inputs.wait_time || '30') }}
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -333,7 +426,12 @@ jobs:
         run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
       - name: Promover release
         run: |
-          argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          health=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
+          if [ "$health" = Healthy ]; then
+            echo "Release já promovida automaticamente ao fim da pausa"
+          else
+            argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          fi
           argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
       - name: Status do Rollout
         if: always()
@@ -377,7 +475,7 @@ jobs:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
-      # !failure() keeps the steps running when the run was cancelled (e.g. promote timeout).
+      # !failure() keeps the steps running when the run was cancelled.
       - name: Instalar CLI de deploy
         if: ${{ !failure() }}
         run: |
@@ -436,8 +534,8 @@ jobs:
             reason="A validação de tráfego do canary falhou; a aprovação não foi solicitada."
           else
             case "$PROMOTE_RESULT" in
-              cancelled) reason="A promoção foi cancelada ou excedeu ${WAIT_TIME} minutos." ;;
-              failure) reason="O deploy foi rejeitado por um revisor ou a promoção falhou." ;;
+              cancelled) reason="A promoção foi cancelada." ;;
+              failure) reason="O deploy foi rejeitado (por um revisor ou por não ter sido promovido após a pausa de ${WAIT_TIME} minutos) ou a promoção falhou." ;;
               *) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos, foi rejeitado ou falhou." ;;
             esac
           fi
