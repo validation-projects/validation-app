@@ -36,9 +36,9 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -49,7 +49,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -61,7 +61,7 @@ jobs:
 
   config:
     name: Load pipeline config
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       model: ${{ steps.config.outputs.model }}
       wait-time: ${{ steps.config.outputs.wait-time }}
@@ -114,27 +114,22 @@ jobs:
             echo "wait-time=$wait_time"
             echo "status-url=$status_url"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Configuração da pipeline canary"
-            echo ""
-            echo "| Item | Valor |"
-            echo "| --- | --- |"
-            echo "| Modelo | \`$model\` |"
-            echo "| Tempo de espera | ${wait_time} min |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build
     needs: [lint, test]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           load: true
@@ -151,7 +146,7 @@ jobs:
   security-scan:
     name: Security scan
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -173,7 +168,7 @@ jobs:
     name: Publish image
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [build, security-scan]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -182,13 +177,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: push
         uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           push: true
@@ -198,7 +196,7 @@ jobs:
   update-gitops:
     name: Update GitOps manifests
     needs: [config, build, publish-image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       MODEL: ${{ needs.config.outputs.model }}
       WAIT_TIME: ${{ needs.config.outputs.wait-time }}
@@ -245,7 +243,7 @@ jobs:
   deploy-with-argocd:
     name: Deploy canary
     needs: [config, build, update-gitops]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       stable_version: ${{ steps.stable.outputs.version }}
       app-namespace: ${{ steps.pause.outputs.app-namespace }}
@@ -386,12 +384,12 @@ jobs:
             else
               jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
             fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          }
 
   smoke-test:
     name: Canary validation
     needs: [config, build, publish-image, deploy-with-argocd]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -411,34 +409,32 @@ jobs:
         if: always()
         env:
           VERSION: ${{ needs.build.outputs.version }}
-          DIGEST: ${{ needs.publish-image.outputs.digest }}
           STABLE_VERSION: ${{ needs.deploy-with-argocd.outputs.stable_version }}
           RATIO_OUTCOME: ${{ steps.ratio.outcome }}
           MODEL: ${{ needs.config.outputs.model }}
+          WAIT_TIME: ${{ needs.config.outputs.wait-time }}
         run: |
-          case "$RATIO_OUTCOME" in
-            success) result="Aprovada" ;;
-            failure) result="Reprovada" ;;
-            *) result="Não executada ($RATIO_OUTCOME)" ;;
-          esac
           {
-            echo "## Validação canary"
+            echo "## Release \`$VERSION\` em canary"
             echo ""
-            echo "| Item | Valor |"
-            echo "| --- | --- |"
-            echo "| Versão | \`$VERSION\` |"
-            echo "| Digest | \`$DIGEST\` |"
-            echo "| Versão estável | \`$STABLE_VERSION\` |"
-            echo "| Peso canary | ${CANARY_WEIGHT}% |"
-            echo "| Modelo da pipeline | \`$MODEL\` |"
-            echo "| Validação de tráfego | $result |"
+            if [ "$RATIO_OUTCOME" = failure ]; then
+              echo "A validação de tráfego falhou; o deploy será revertido."
+            elif [ "$RATIO_OUTCOME" != success ]; then
+              echo "A validação de tráfego não foi executada."
+            else
+              echo "Recebendo ${CANARY_WEIGHT}% do tráfego (estável: \`$STABLE_VERSION\`)."
+              case "$MODEL" in
+                github-approval) echo "Aprove em **canary-approval** em até ${WAIT_TIME} min para promover; sem aprovação, o deploy é revertido." ;;
+                rollout-approval) echo "Promoção automática em ${WAIT_TIME} min. Aprove em **canary-approval** para promover antes ou rejeite para reverter." ;;
+              esac
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   approval-wait:
     name: Wait for approval
     needs: [config, smoke-test]
     if: needs.config.outputs.model == 'github-approval'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       actions: write
     env:
@@ -489,7 +485,7 @@ jobs:
     name: Wait for promotion
     needs: [config, deploy-with-argocd, smoke-test]
     if: needs.config.outputs.model == 'rollout-approval'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       WAIT_TIME: ${{ needs.config.outputs.wait-time }}
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
@@ -632,14 +628,14 @@ jobs:
             else
               jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
             fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          }
 
   # No secrets in this job: values of secrets referenced by a job are masked in its logs and summary.
   rollout-link:
     name: Deployment status link
     needs: [config, build, deploy-with-argocd, smoke-test]
     if: needs.config.outputs.model == 'rollout-link'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Gerar link do deployment
         env:
@@ -688,26 +684,16 @@ jobs:
           {
             echo "## Acompanhar deployment"
             echo ""
-            echo "A release \`$VERSION\` está com ${CANARY_WEIGHT}% do tráfego e o Rollout está pausado."
-            echo "Sem ação, ela é promovida automaticamente $auto."
+            echo "Release \`$VERSION\` com ${CANARY_WEIGHT}% do tráfego; promoção automática $auto."
             echo ""
-            echo "**[Acompanhar e aprovar o deployment]($url)**"
-            echo ""
-            echo "No Rollout, use **Promote-Full** (ou **Promote**) para promover agora ou **Abort** para reverter."
-            echo ""
-            echo "| Item | Valor |"
-            echo "| --- | --- |"
-            echo "| Versão | \`$VERSION\` |"
-            echo "| Peso canary | ${CANARY_WEIGHT}% |"
-            echo "| Pausa do Rollout | ${PAUSE_DURATION:-${WAIT_TIME}m} |"
-            echo "| Pausado em | ${PAUSED_AT:-desconhecido} |"
+            echo "**[Abrir no Argo Rollouts]($url)**: **Promote-Full** promove agora, **Abort** reverte."
           } >> "$GITHUB_STEP_SUMMARY"
 
   promote:
     name: Promote release
     needs: [config, build, smoke-test]
     if: needs.config.outputs.model != 'rollout-link'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment: canary-approval
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
@@ -753,19 +739,19 @@ jobs:
             else
               jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
             fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          }
       - name: Resumo da promoção
         env:
           VERSION: ${{ needs.build.outputs.version }}
           AUTO: ${{ steps.promote.outputs.auto }}
         run: |
           {
-            echo "## Promoção concluída"
+            echo "## Release \`$VERSION\` promovida"
             echo ""
             if [ "$AUTO" = true ]; then
-              echo "Release \`$VERSION\` promovida automaticamente para 100% do tráfego ao fim da pausa."
+              echo "100% do tráfego na nova versão (promoção automática ao fim da pausa)."
             else
-              echo "Release \`$VERSION\` promovida para 100% do tráfego."
+              echo "100% do tráfego na nova versão."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -777,7 +763,7 @@ jobs:
       always() && needs.smoke-test.result != 'skipped' &&
       (needs.smoke-test.result != 'success' ||
       (needs.config.outputs.model != 'rollout-link' && needs.promote.result != 'success'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       MODEL: ${{ needs.config.outputs.model }}
       WAIT_TIME: ${{ needs.config.outputs.wait-time }}
@@ -830,7 +816,7 @@ jobs:
             else
               jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
             fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          }
       - name: Resumo do rollback
         if: always()
         env:
@@ -861,11 +847,4 @@ jobs:
             echo "$reason"
             echo ""
             echo "$restored"
-            echo ""
-            echo "| Item | Valor |"
-            echo "| --- | --- |"
-            echo "| Versão | \`$VERSION\` |"
-            echo "| Validação canary | ${SMOKE_RESULT} |"
-            echo "| Promoção | ${PROMOTE_RESULT} |"
-            echo "| Tempo de espera | ${WAIT_TIME} min |"
           } >> "$GITHUB_STEP_SUMMARY"

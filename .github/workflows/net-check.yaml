@@ -8,7 +8,7 @@ permissions:
 jobs:
   check:
     name: Network check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: DNS
         run: dig +short ingress.diegovieira.app
