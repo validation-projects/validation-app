@@ -651,10 +651,20 @@ jobs:
           PAUSED_AT: ${{ needs.deploy-with-argocd.outputs.paused-at }}
           PAUSE_DURATION: ${{ needs.deploy-with-argocd.outputs.pause-duration }}
         run: |
-          url="$STATUS_URL/applications/${APP_NAMESPACE:+$APP_NAMESPACE/}$ARGOCD_APP"
-          if [ -n "$ROLLOUT_NAMESPACE" ]; then
-            node=$(jq -rn --arg n "argoproj.io/Rollout/$ROLLOUT_NAMESPACE/$ARGOCD_ROLLOUT/0" '$n | @uri')
-            url="$url?resource=&node=$node"
+          if [[ "$STATUS_URL" == *"{"* ]]; then
+            if [ -n "$ROLLOUT_NAMESPACE" ]; then
+              url=${STATUS_URL//\{namespace\}/$ROLLOUT_NAMESPACE}
+              url=${url//\{rollout\}/$ARGOCD_ROLLOUT}
+            else
+              url=${STATUS_URL%%\{*}
+              echo "::warning::Namespace do Rollout desconhecido; o link aponta para $url"
+            fi
+          else
+            url="$STATUS_URL/applications/${APP_NAMESPACE:+$APP_NAMESPACE/}$ARGOCD_APP"
+            if [ -n "$ROLLOUT_NAMESPACE" ]; then
+              node=$(jq -rn --arg n "argoproj.io/Rollout/$ROLLOUT_NAMESPACE/$ARGOCD_ROLLOUT/0" '$n | @uri')
+              url="$url?resource=&node=$node"
+            fi
           fi
           secs=""
           if [[ "$PAUSE_DURATION" =~ ^([0-9]+)([smh]?)$ ]]; then
@@ -683,7 +693,7 @@ jobs:
             echo ""
             echo "**[Acompanhar e aprovar o deployment]($url)**"
             echo ""
-            echo "No Rollout, use **Promote-Full** (ou **Resume**) para promover agora ou **Abort** para reverter."
+            echo "No Rollout, use **Promote-Full** (ou **Promote**) para promover agora ou **Abort** para reverter."
             echo ""
             echo "| Item | Valor |"
             echo "| --- | --- |"

@@ -27,11 +27,11 @@ endpoint de smoke test precisam estar acessíveis publicament.
 
 ## Modelos da pipeline canary (`gha-config.yml`)
 
-| Chave                   | Uso                                                                |
-| ----------------------- | ------------------------------------------------------------------ |
-| `canary-pipeline-model` | `github-approval` (padrão), `rollout-approval` ou `rollout-link`   |
-| `canary-wait-time`      | minutos de espera pela aprovação (o input `wait_time` sobrescreve) |
-| `canary-status-url`     | URL base da UI usada no link do modelo `rollout-link`              |
+| Chave                   | Uso                                                                                      |
+| ----------------------- | ---------------------------------------------------------------------------------------- |
+| `canary-pipeline-model` | `github-approval` (padrão), `rollout-approval` ou `rollout-link`                         |
+| `canary-wait-time`      | minutos de espera pela aprovação (o input `wait_time` sobrescreve)                       |
+| `canary-status-url`     | link do modelo `rollout-link`; `{namespace}` e `{rollout}` são substituídos pelo Rollout |
 
 - `github-approval`: o Rollout pausa com `pause: {}` e o Actions conta o tempo enquanto o environment
   `canary-approval` aguarda revisão. Sem aprovação o run é cancelado e o deploy é revertido.

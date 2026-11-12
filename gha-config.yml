@@ -14,5 +14,6 @@ canary-pipeline-model: github-approval
 # Minutes the canary waits for approval (positive integer).
 canary-wait-time: 30
 
-# Base URL of the UI used in the rollout-link status link.
-canary-status-url: https://argo.diegovieira.app
+# URL of the rollout-link status link. {namespace} and {rollout} are replaced with the Rollout's
+# namespace and name; without placeholders it is the base URL of the Argo CD UI.
+canary-status-url: https://argo.diegovieira.app/rollouts/rollout/{namespace}/{rollout}
