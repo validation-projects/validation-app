@@ -12,10 +12,10 @@ on:
         required: false
         default: '50'
       wait_time:
-        description: Tempo em minutos aguardando aprovação para promover o deploy (sem aprovação, o deploy é revertido)
+        description: Tempo em minutos aguardando aprovação (vazio = canary-wait-time do gha-config.yml)
         type: string
         required: false
-        default: '30'
+        default: ''
       stable_version:
         description: Versão estável atual (vazio = detectar pela versão servida antes do deploy)
         type: string
@@ -31,7 +31,6 @@ env:
   ARGOCD_APP: canary-demo
   ARGOCD_ROLLOUT: canary-demo
   CANARY_WEIGHT: ${{ inputs.canary_weight || '50' }}
-  WAIT_TIME: ${{ inputs.wait_time || '30' }}
   SMOKE_INSECURE: ${{ vars.SMOKE_INSECURE || 'false' }}
 
 jobs:
@@ -59,6 +58,70 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  config:
+    name: Load pipeline config
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.config.outputs.model }}
+      wait-time: ${{ steps.config.outputs.wait-time }}
+      status-url: ${{ steps.config.outputs.status-url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Instalar yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Ler gha-config.yml
+        id: config
+        env:
+          CONFIG_FILE: gha-config.yml
+          WAIT_TIME_INPUT: ${{ inputs.wait_time }}
+        run: |
+          model="" wait_time="" status_url=""
+          if [ -f "$CONFIG_FILE" ]; then
+            model=$(yq '.["canary-pipeline-model"] // ""' "$CONFIG_FILE")
+            wait_time=$(yq '.["canary-wait-time"] // ""' "$CONFIG_FILE")
+            status_url=$(yq '.["canary-status-url"] // ""' "$CONFIG_FILE")
+          else
+            echo "::warning::$CONFIG_FILE não encontrado; usando o modelo github-approval e 30 minutos"
+          fi
+          model=${model:-github-approval}
+          wait_time=${WAIT_TIME_INPUT:-${wait_time:-30}}
+          status_url=${status_url%/}
+          case "$model" in
+            github-approval | rollout-approval | rollout-link) ;;
+            *)
+              echo "::error file=$CONFIG_FILE::canary-pipeline-model inválido: '$model' (use github-approval, rollout-approval ou rollout-link)"
+              exit 1
+              ;;
+          esac
+          if ! [[ "$wait_time" =~ ^[0-9]+$ ]] || (( 10#$wait_time < 1 )); then
+            echo "::error file=$CONFIG_FILE::canary-wait-time deve ser um inteiro positivo (recebido: '$wait_time')"
+            exit 1
+          fi
+          wait_time=$(( 10#$wait_time ))
+          if [ "$model" = rollout-link ] && ! [[ "$status_url" =~ ^https?://[^/]+ ]]; then
+            echo "::error file=$CONFIG_FILE::canary-status-url deve ser uma URL http(s) no modelo rollout-link (recebido: '$status_url')"
+            exit 1
+          fi
+          echo "Modelo da pipeline canary: $model"
+          echo "Tempo de espera: ${wait_time} min${WAIT_TIME_INPUT:+ (input wait_time)}"
+          {
+            echo "model=$model"
+            echo "wait-time=$wait_time"
+            echo "status-url=$status_url"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Configuração da pipeline canary"
+            echo ""
+            echo "| Item | Valor |"
+            echo "| --- | --- |"
+            echo "| Modelo | \`$model\` |"
+            echo "| Tempo de espera | ${wait_time} min |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build
@@ -134,8 +197,11 @@ jobs:
 
   update-gitops:
     name: Update GitOps manifests
-    needs: [build, publish-image]
+    needs: [config, build, publish-image]
     runs-on: ubuntu-latest
+    env:
+      MODEL: ${{ needs.config.outputs.model }}
+      WAIT_TIME: ${{ needs.config.outputs.wait-time }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -152,7 +218,7 @@ jobs:
         run: |
           kustomize edit set image canary-demo=${IMAGE}@${{ needs.publish-image.outputs.digest }}
           kustomize build . > /dev/null
-      - name: Atualizar peso do canary
+      - name: Atualizar peso e pausa do canary
         working-directory: clusters/lab/app-canary
         run: |
           if ! [[ "$CANARY_WEIGHT" =~ ^[0-9]+$ ]] || (( CANARY_WEIGHT < 1 || CANARY_WEIGHT > 99 )); then
@@ -160,6 +226,13 @@ jobs:
             exit 1
           fi
           yq -i '.spec.strategy.canary.steps[0].setWeight = env(CANARY_WEIGHT)' rollout.yaml
+          if [ "$MODEL" = github-approval ]; then
+            # Paused until promote resumes it or rollback aborts it.
+            yq -i '(.spec.strategy.canary.steps[] | select(has("pause")) | .pause) = {}' rollout.yaml
+          else
+            # The Rollout counts the wait and promotes itself when the pause expires.
+            PAUSE_DURATION="${WAIT_TIME}m" yq -i '(.spec.strategy.canary.steps[] | select(has("pause")) | .pause) = {"duration": strenv(PAUSE_DURATION)}' rollout.yaml
+          fi
           yq '.spec.strategy.canary.steps' rollout.yaml
           kustomize build . > /dev/null
       - name: Commit e push
@@ -171,10 +244,14 @@ jobs:
 
   deploy-with-argocd:
     name: Deploy canary
-    needs: [build, update-gitops]
+    needs: [config, build, update-gitops]
     runs-on: ubuntu-latest
     outputs:
       stable_version: ${{ steps.stable.outputs.version }}
+      app-namespace: ${{ steps.pause.outputs.app-namespace }}
+      rollout-namespace: ${{ steps.pause.outputs.rollout-namespace }}
+      paused-at: ${{ steps.pause.outputs.paused-at }}
+      pause-duration: ${{ steps.pause.outputs.pause-duration }}
     env:
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -252,6 +329,41 @@ jobs:
             sleep 5
           done
           echo "Timeout aguardando pausa"; exit 1
+      # Read from the live Rollout: start and duration of the pause that counts the wait.
+      - name: Ler pausa do Rollout
+        id: pause
+        if: needs.config.outputs.model != 'github-approval'
+        run: |
+          app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json)
+          rollout_ns=$(jq -r --arg r "$ARGOCD_ROLLOUT" '.status.resources[]? | select(.kind == "Rollout" and .name == $r) | .namespace' <<<"$app")
+          echo "app-namespace=$(jq -r '.metadata.namespace // ""' <<<"$app")" >> "$GITHUB_OUTPUT"
+          echo "rollout-namespace=$rollout_ns" >> "$GITHUB_OUTPUT"
+          rollout_live() {
+            local raw
+            raw=$(curl -sSf -m 15 -G -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" \
+              "https://$ARGOCD_SERVER/api/v1/applications/$ARGOCD_APP/resource" \
+              --data-urlencode "namespace=$rollout_ns" --data-urlencode "resourceName=$ARGOCD_ROLLOUT" \
+              -d group=argoproj.io -d version=v1alpha1 -d kind=Rollout) || return 1
+            jq -c '.manifest | fromjson' <<<"$raw"
+          }
+          # phase|abort|pause start|pause duration|message of the current canary step.
+          pause_info() {
+            jq -r '(.status.currentStepIndex // 0) as $i | [
+              .status.phase // "Unknown",
+              (.status.abort // false | tostring),
+              ([.status.pauseConditions[]? | select(.reason == "CanaryPauseStep") | .startTime][0] // ""),
+              (.spec.strategy.canary.steps[$i].pause.duration // "" | tostring),
+              (.status.message // "" | gsub("[|\n]"; " "))
+            ] | join("|")'
+          }
+          if ! live=$(rollout_live); then
+            echo "::warning::Não foi possível ler a pausa do Rollout"
+            exit 0
+          fi
+          IFS='|' read -r phase _ paused_at duration message <<<"$(pause_info <<<"$live")"
+          echo "Rollout $phase: pausa de ${duration:-?} iniciada em ${paused_at:-?}${message:+ ($message)}"
+          echo "paused-at=$paused_at" >> "$GITHUB_OUTPUT"
+          echo "pause-duration=$duration" >> "$GITHUB_OUTPUT"
       - name: Status do Rollout
         if: always()
         env:
@@ -278,7 +390,7 @@ jobs:
 
   smoke-test:
     name: Canary validation
-    needs: [build, publish-image, deploy-with-argocd]
+    needs: [config, build, publish-image, deploy-with-argocd]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -302,6 +414,7 @@ jobs:
           DIGEST: ${{ needs.publish-image.outputs.digest }}
           STABLE_VERSION: ${{ needs.deploy-with-argocd.outputs.stable_version }}
           RATIO_OUTCOME: ${{ steps.ratio.outcome }}
+          MODEL: ${{ needs.config.outputs.model }}
         run: |
           case "$RATIO_OUTCOME" in
             success) result="Aprovada" ;;
@@ -317,16 +430,19 @@ jobs:
             echo "| Digest | \`$DIGEST\` |"
             echo "| Versão estável | \`$STABLE_VERSION\` |"
             echo "| Peso canary | ${CANARY_WEIGHT}% |"
+            echo "| Modelo da pipeline | \`$MODEL\` |"
             echo "| Validação de tráfego | $result |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   approval-wait:
     name: Wait for approval
-    needs: [smoke-test]
+    needs: [config, smoke-test]
+    if: needs.config.outputs.model == 'github-approval'
     runs-on: ubuntu-latest
     permissions:
       actions: write
     env:
+      WAIT_TIME: ${{ needs.config.outputs.wait-time }}
       GH_TOKEN: ${{ github.token }}
       APPROVAL_ENVIRONMENT: canary-approval
       PROMOTE_JOB: Promote release
@@ -335,10 +451,6 @@ jobs:
       # cancelled and rollback aborts the Rollout.
       - name: Aguardar aprovação por até ${{ env.WAIT_TIME }} minutos
         run: |
-          if ! [[ "$WAIT_TIME" =~ ^[0-9]+$ ]] || (( WAIT_TIME < 1 )); then
-            echo "::error::wait_time deve ser um inteiro positivo (recebido: '$WAIT_TIME')"
-            exit 1
-          fi
           api="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           start=$(date +%s)
           deadline=$(( start + WAIT_TIME * 60 ))
@@ -373,9 +485,218 @@ jobs:
           # Wait for the cancellation to reach this job.
           sleep 300
 
+  rollout-wait:
+    name: Wait for promotion
+    needs: [config, deploy-with-argocd, smoke-test]
+    if: needs.config.outputs.model == 'rollout-approval'
+    runs-on: ubuntu-latest
+    env:
+      WAIT_TIME: ${{ needs.config.outputs.wait-time }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ROLLOUT_NAMESPACE: ${{ needs.deploy-with-argocd.outputs.rollout-namespace }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      APPROVAL_ENVIRONMENT: canary-approval
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: |
+          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+          echo "::add-mask::$GH_TOKEN"
+      # The remaining time comes from the Rollout pause; it promotes itself when the pause expires
+      # and promote resumes it earlier when canary-approval is approved.
+      - name: Aguardar promoção do Rollout
+        id: wait
+        run: |
+          rollout_ns="$ROLLOUT_NAMESPACE"
+          rollout_live() {
+            local raw
+            raw=$(curl -sSf -m 15 -G -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" \
+              "https://$ARGOCD_SERVER/api/v1/applications/$ARGOCD_APP/resource" \
+              --data-urlencode "namespace=$rollout_ns" --data-urlencode "resourceName=$ARGOCD_ROLLOUT" \
+              -d group=argoproj.io -d version=v1alpha1 -d kind=Rollout) || return 1
+            jq -c '.manifest | fromjson' <<<"$raw"
+          }
+          # phase|abort|pause start|pause duration|message of the current canary step.
+          pause_info() {
+            jq -r '(.status.currentStepIndex // 0) as $i | [
+              .status.phase // "Unknown",
+              (.status.abort // false | tostring),
+              ([.status.pauseConditions[]? | select(.reason == "CanaryPauseStep") | .startTime][0] // ""),
+              (.spec.strategy.canary.steps[$i].pause.duration // "" | tostring),
+              (.status.message // "" | gsub("[|\n]"; " "))
+            ] | join("|")'
+          }
+          to_seconds() {
+            [[ "$1" =~ ^([0-9]+)([smh]?)$ ]] || return 0
+            case "${BASH_REMATCH[2]}" in
+              h) echo $(( BASH_REMATCH[1] * 3600 )) ;;
+              m) echo $(( BASH_REMATCH[1] * 60 )) ;;
+              *) echo "${BASH_REMATCH[1]}" ;;
+            esac
+          }
+          # Safety net in case the Rollout never leaves the pause.
+          deadline=$(( $(date +%s) + (WAIT_TIME + 10) * 60 ))
+          while :; do
+            now=$(date +%s)
+            if [ -n "$rollout_ns" ] && live=$(rollout_live); then
+              IFS='|' read -r phase abort paused_at duration message <<<"$(pause_info <<<"$live")"
+            else
+              health=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | "\(.health.status)|\(.health.message // "")"') || health="Unknown|"
+              phase=${health%%|*} message=${health#*|} paused_at="" duration="" abort=false
+              case "$message" in *[Aa]bort*) abort=true ;; esac
+            fi
+            result=""
+            if [ "$abort" = true ]; then
+              result=aborted
+            else
+              case "$phase" in
+                Healthy) result=promoted ;;
+                Degraded) result=degraded ;;
+              esac
+            fi
+            [ -n "$result" ] && break
+            secs=$(to_seconds "$duration")
+            if [ -n "$paused_at" ] && [ -n "$secs" ]; then
+              remaining=$(( $(date -d "$paused_at" +%s) + secs - now ))
+              if (( remaining < 0 )); then remaining=0; fi
+              printf 'Rollout %s: promoção automática em %dm%02ds (pausa de %s iniciada em %s)\n' \
+                "$phase" $(( remaining / 60 )) $(( remaining % 60 )) "$duration" "$paused_at"
+            else
+              echo "Rollout $phase${message:+: $message}"
+            fi
+            if (( now >= deadline )); then
+              result=timeout
+              break
+            fi
+            sleep 15
+          done
+          echo "Resultado: $result${message:+ ($message)}"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      # Resolves the pending promote job when the Rollout was promoted (or failed) on its own.
+      - name: Concluir aprovação pendente
+        if: always() && steps.wait.outputs.result != 'aborted'
+        env:
+          RESULT: ${{ steps.wait.outputs.result }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/pending_deployments"
+          ids=$(gh api "$api" --jq "[.[] | select(.environment.name == \"$APPROVAL_ENVIRONMENT\") | .environment.id]")
+          if [ "$ids" = "[]" ]; then
+            if [ "$RESULT" = promoted ]; then
+              comment="Release aprovada em $APPROVAL_ENVIRONMENT antes do fim da pausa de ${WAIT_TIME} minutos."
+            else
+              comment="Nenhuma aprovação pendente em $APPROVAL_ENVIRONMENT (resultado: ${RESULT:-erro})."
+            fi
+            echo "$comment"
+            echo "$comment" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$RESULT" = promoted ]; then
+            state=approved
+            comment="Release promovida automaticamente ao fim da pausa de ${WAIT_TIME} minutos."
+          else
+            state=rejected
+            comment="Release não promovida (${RESULT:-erro}); o deploy será revertido."
+          fi
+          if ! jq -n --argjson ids "$ids" --arg state "$state" --arg comment "$comment" \
+            '{environment_ids: $ids, state: $state, comment: $comment}' |
+            gh api -X POST "$api" --input - > /dev/null; then
+            echo "::error::Não foi possível registrar '$state' em $APPROVAL_ENVIRONMENT; o dono do GH_TOKEN precisa ser revisor do environment"
+            exit 1
+          fi
+          echo "$APPROVAL_ENVIRONMENT: $state — $comment"
+          echo "$comment" >> "$GITHUB_STEP_SUMMARY"
+      - name: Status do Rollout
+        if: always()
+        env:
+          STAGE: aguardando promoção
+        run: |
+          if ! app=$(argocd app get "$ARGOCD_APP" --grpc-web -o json); then
+            echo "::warning::Não foi possível obter o status do Rollout"
+            exit 0
+          fi
+          rollout=$(jq -c '.status.resources[]? | select(.kind=="Rollout")' <<<"$app")
+          echo "Recurso Rollout:"
+          jq . <<<"$rollout"
+          {
+            echo "## Status do Rollout ($STAGE)"
+            echo ""
+            echo "| Nome | Sync | Health | Mensagem |"
+            echo "| --- | --- | --- | --- |"
+            if [ -z "$rollout" ]; then
+              echo "| - | - | - | Nenhum Rollout encontrado |"
+            else
+              jq -r '[.name, .status, .health.status, .health.message] | map(. // "-" | tostring | gsub("\\|"; "\\|") | gsub("\n"; " ")) | "| " + join(" | ") + " |"' <<<"$rollout"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # No secrets in this job: values of secrets referenced by a job are masked in its logs and summary.
+  rollout-link:
+    name: Deployment status link
+    needs: [config, build, deploy-with-argocd, smoke-test]
+    if: needs.config.outputs.model == 'rollout-link'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gerar link do deployment
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          WAIT_TIME: ${{ needs.config.outputs.wait-time }}
+          STATUS_URL: ${{ needs.config.outputs.status-url }}
+          APP_NAMESPACE: ${{ needs.deploy-with-argocd.outputs.app-namespace }}
+          ROLLOUT_NAMESPACE: ${{ needs.deploy-with-argocd.outputs.rollout-namespace }}
+          PAUSED_AT: ${{ needs.deploy-with-argocd.outputs.paused-at }}
+          PAUSE_DURATION: ${{ needs.deploy-with-argocd.outputs.pause-duration }}
+        run: |
+          url="$STATUS_URL/applications/${APP_NAMESPACE:+$APP_NAMESPACE/}$ARGOCD_APP"
+          if [ -n "$ROLLOUT_NAMESPACE" ]; then
+            node=$(jq -rn --arg n "argoproj.io/Rollout/$ROLLOUT_NAMESPACE/$ARGOCD_ROLLOUT/0" '$n | @uri')
+            url="$url?resource=&node=$node"
+          fi
+          secs=""
+          if [[ "$PAUSE_DURATION" =~ ^([0-9]+)([smh]?)$ ]]; then
+            case "${BASH_REMATCH[2]}" in
+              h) secs=$(( BASH_REMATCH[1] * 3600 )) ;;
+              m) secs=$(( BASH_REMATCH[1] * 60 )) ;;
+              *) secs=${BASH_REMATCH[1]} ;;
+            esac
+          fi
+          if [ -n "$PAUSED_AT" ] && [ -n "$secs" ]; then
+            promote_at=$(( $(date -d "$PAUSED_AT" +%s) + secs ))
+            remaining=$(( (promote_at - $(date +%s)) / 60 ))
+            if (( remaining < 0 )); then remaining=0; fi
+            auto="em $(date -u -d "@$promote_at" '+%Y-%m-%d %H:%M:%S UTC') (faltam ~${remaining} min)"
+          else
+            auto="ao fim da pausa de ${WAIT_TIME} minutos"
+          fi
+          echo "Acompanhe e aprove o deployment: $url"
+          echo "Promoção automática $auto"
+          echo "::notice title=Acompanhar deployment::Release $VERSION em ${CANARY_WEIGHT}% do tráfego; promoção automática $auto. Acompanhe e aprove em $url"
+          {
+            echo "## Acompanhar deployment"
+            echo ""
+            echo "A release \`$VERSION\` está com ${CANARY_WEIGHT}% do tráfego e o Rollout está pausado."
+            echo "Sem ação, ela é promovida automaticamente $auto."
+            echo ""
+            echo "**[Acompanhar e aprovar o deployment]($url)**"
+            echo ""
+            echo "No Rollout, use **Promote-Full** (ou **Resume**) para promover agora ou **Abort** para reverter."
+            echo ""
+            echo "| Item | Valor |"
+            echo "| --- | --- |"
+            echo "| Versão | \`$VERSION\` |"
+            echo "| Peso canary | ${CANARY_WEIGHT}% |"
+            echo "| Pausa do Rollout | ${PAUSE_DURATION:-${WAIT_TIME}m} |"
+            echo "| Pausado em | ${PAUSED_AT:-desconhecido} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   promote:
     name: Promote release
-    needs: [build, smoke-test]
+    needs: [config, build, smoke-test]
+    if: needs.config.outputs.model != 'rollout-link'
     runs-on: ubuntu-latest
     environment: canary-approval
     env:
@@ -390,8 +711,15 @@ jobs:
       - name: Mascarar credenciais
         run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
       - name: Promover release
+        id: promote
         run: |
-          argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          health=$(argocd app get "$ARGOCD_APP" --grpc-web -o json | jq -r '.status.resources[]? | select(.kind=="Rollout") | .health.status')
+          if [ "$health" = Healthy ]; then
+            echo "Release já promovida pelo Rollout ao fim da pausa"
+            echo "auto=true" >> "$GITHUB_OUTPUT"
+          else
+            argocd app actions run "$ARGOCD_APP" resume --kind Rollout --resource-name "$ARGOCD_ROLLOUT" --grpc-web
+          fi
           argocd app wait "$ARGOCD_APP" --grpc-web --health --timeout 300
       - name: Status do Rollout
         if: always()
@@ -419,19 +747,30 @@ jobs:
       - name: Resumo da promoção
         env:
           VERSION: ${{ needs.build.outputs.version }}
+          AUTO: ${{ steps.promote.outputs.auto }}
         run: |
           {
             echo "## Promoção concluída"
             echo ""
-            echo "Release \`$VERSION\` promovida para 100% do tráfego."
+            if [ "$AUTO" = true ]; then
+              echo "Release \`$VERSION\` promovida automaticamente para 100% do tráfego ao fim da pausa."
+            else
+              echo "Release \`$VERSION\` promovida para 100% do tráfego."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   rollback:
     name: Roll back deploy
-    needs: [build, smoke-test, promote]
-    if: always() && needs.smoke-test.result != 'skipped' && needs.promote.result != 'success'
+    needs: [config, build, smoke-test, promote]
+    # rollout-link has no promote job: only a failed canary validation rolls it back.
+    if: >-
+      always() && needs.smoke-test.result != 'skipped' &&
+      (needs.smoke-test.result != 'success' ||
+      (needs.config.outputs.model != 'rollout-link' && needs.promote.result != 'success'))
     runs-on: ubuntu-latest
     env:
+      MODEL: ${{ needs.config.outputs.model }}
+      WAIT_TIME: ${{ needs.config.outputs.wait-time }}
       ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
     steps:
@@ -493,9 +832,11 @@ jobs:
           if [ "$SMOKE_RESULT" != "success" ]; then
             reason="A validação de tráfego do canary falhou; a aprovação não foi solicitada."
           else
-            case "$PROMOTE_RESULT" in
-              cancelled) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos ou o run foi cancelado." ;;
-              failure) reason="O deploy foi rejeitado por um revisor ou a promoção falhou." ;;
+            case "$MODEL:$PROMOTE_RESULT" in
+              github-approval:cancelled) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos ou o run foi cancelado." ;;
+              github-approval:failure) reason="O deploy foi rejeitado por um revisor ou a promoção falhou." ;;
+              rollout-approval:cancelled) reason="O run foi cancelado antes da promoção." ;;
+              rollout-approval:failure) reason="O deploy foi rejeitado por um revisor, não foi promovido ao fim da pausa de ${WAIT_TIME} minutos ou a promoção falhou." ;;
               *) reason="O deploy não foi aprovado dentro de ${WAIT_TIME} minutos, foi rejeitado ou falhou." ;;
             esac
           fi

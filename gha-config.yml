@@ -1,0 +1,18 @@
+# Canary pipeline settings read by .github/workflows/ci-cd.yaml.
+#
+# canary-pipeline-model:
+#   github-approval  - the Rollout pauses with `pause: {}`; Actions counts canary-wait-time while the
+#                      `canary-approval` environment waits for a reviewer. Without approval the run is
+#                      cancelled and the deploy is rolled back.
+#   rollout-approval - the Rollout pauses with `pause: {duration: <canary-wait-time>m}` and promotes itself
+#                      when it expires; the remaining time is read from the Rollout. Approving
+#                      `canary-approval` promotes it right away, rejecting rolls it back.
+#   rollout-link     - same pause as rollout-approval, without environments: the run ends with a link to
+#                      follow the Rollout and promote or abort it there.
+canary-pipeline-model: github-approval
+
+# Minutes the canary waits for approval (positive integer).
+canary-wait-time: 30
+
+# Base URL of the UI used in the rollout-link status link.
+canary-status-url: https://argo.diegovieira.app
