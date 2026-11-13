@@ -29,6 +29,7 @@ env:
   EPHEMERAL_LABEL: validation-projects/ephemeral
   GITOPS_REPO: git@github.com:validation-projects/argo-gitops-repo.git
   GITOPS_PATH: clusters/lab/app-canary-ephemeral
+  REMOVAL_ENVIRONMENT: ephemeral-removal
 
 jobs:
   config:
@@ -62,6 +63,19 @@ jobs:
           ttl=$(( 10#$ttl ))
           echo "Tempo de vida do ambiente efêmero: ${ttl} min${TTL_INPUT:+ (input ttl)}"
           echo "ttl=$ttl" >> "$GITHUB_OUTPUT"
+      # GitHub auto-creates a missing environment without protection, which would remove the
+      # environment right after the deploy.
+      - name: Verificar environment de remoção
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! rules=$(gh api "repos/$GITHUB_REPOSITORY/environments/$REMOVAL_ENVIRONMENT" --jq '[.protection_rules[]?.type]' 2>/dev/null); then
+            rules=inexistente
+          fi
+          if [[ "$rules" != *required_reviewers* ]]; then
+            echo "::error::O environment $REMOVAL_ENVIRONMENT precisa existir com required reviewers (encontrado: $rules)"
+            exit 1
+          fi
 
   build:
     name: Build and publish image
@@ -157,7 +171,7 @@ jobs:
             echo "Versão \`$VERSION\` no namespace \`$EPHEMERAL_NAMESPACE\`."
             echo ""
             echo "Removido automaticamente em **$EXPIRES_AT** (UTC, ${TTL} min)."
-            echo "Para remover antes, aprove o environment \`ephemeral-removal\` deste run."
+            echo "Para remover antes, aprove o environment \`$REMOVAL_ENVIRONMENT\` deste run."
           } >> "$GITHUB_STEP_SUMMARY"
 
   remove:
