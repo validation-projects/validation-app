@@ -9,7 +9,7 @@
 #                      `canary-approval` promotes it right away, rejecting rolls it back.
 #   rollout-link     - same pause as rollout-approval, without environments: the run ends with a link to
 #                      follow the Rollout and promote or abort it there.
-canary-pipeline-model: github-approval
+canary-pipeline-model: rollout-approval
 
 # Minutes the canary waits for approval (positive integer).
 canary-wait-time: 30
