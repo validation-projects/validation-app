@@ -1,0 +1,81 @@
+name: ephemeral-cleanup
+
+# Removes ephemeral environments (see ephemeral.yaml) whose expires-at has passed and resolves the
+# ephemeral-removal approval still pending in the run that deployed them.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ephemeral-cleanup
+
+env:
+  ARGOCD_VERSION: v2.9.7
+  ARGOCD_PROJECT: canary-demo
+  EPHEMERAL_LABEL: validation-projects/ephemeral
+  REMOVAL_ENVIRONMENT: ephemeral-removal
+
+jobs:
+  cleanup:
+    name: Remove expired ephemeral environments
+    runs-on: ubuntu-26.04
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      # Its owner must be a reviewer of the ephemeral-removal environment.
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Remover ambientes vencidos
+        run: |
+          apps=$(argocd app list --grpc-web -p "$ARGOCD_PROJECT" -l "$EPHEMERAL_LABEL=true" -o json)
+          now=$(date -u +%s)
+          removed=0 failed=0
+          while read -r app; do
+            [ -n "$app" ] || continue
+            name=$(jq -r '.metadata.name' <<<"$app")
+            expires_at=$(jq -r '.metadata.annotations["validation-projects/expires-at"] // ""' <<<"$app")
+            run_id=$(jq -r '.metadata.annotations["validation-projects/run-id"] // ""' <<<"$app")
+            if ! expires=$(date -u -d "$expires_at" +%s 2>/dev/null) || [ -z "$expires_at" ]; then
+              echo "::warning::$name sem expires-at válido ('$expires_at'); ignorado"
+              continue
+            fi
+            if (( now < expires )); then
+              echo "$name: remoção automática em $(( (expires - now + 59) / 60 )) min ($expires_at)"
+              continue
+            fi
+            echo "$name: expirou em $expires_at; removendo"
+            if ! argocd app delete "$name" --cascade -y --grpc-web; then
+              echo "::error::Falha ao remover $name"
+              failed=$(( failed + 1 ))
+              continue
+            fi
+            removed=$(( removed + 1 ))
+            echo "- \`$name\` removido (expirou em $expires_at UTC)" >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$run_id" ] || continue
+            api="repos/$GITHUB_REPOSITORY/actions/runs/$run_id/pending_deployments"
+            if ! ids=$(gh api "$api" --jq "[.[] | select(.environment.name == \"$REMOVAL_ENVIRONMENT\") | .environment.id]"); then
+              echo "::warning::Não foi possível consultar o run $run_id"
+              continue
+            fi
+            [ "$ids" != "[]" ] || continue
+            if jq -n --argjson ids "$ids" --arg comment "Ambiente $name removido automaticamente (expirou em $expires_at UTC)." \
+              '{environment_ids: $ids, state: "approved", comment: $comment}' |
+              gh api -X POST "$api" --input - > /dev/null; then
+              echo "$REMOVAL_ENVIRONMENT do run $run_id concluído"
+            else
+              echo "::warning::Não foi possível aprovar $REMOVAL_ENVIRONMENT no run $run_id; o dono do GH_TOKEN precisa ser revisor do environment"
+            fi
+          done < <(jq -c '.[]?' <<<"$apps")
+          echo "Ambientes removidos: $removed"
+          (( failed == 0 ))

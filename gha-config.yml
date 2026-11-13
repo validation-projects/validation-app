@@ -17,3 +17,7 @@ canary-wait-time: 30
 # URL of the rollout-link status link. {namespace} and {rollout} are replaced with the Rollout's
 # namespace and name; without placeholders it is the base URL of the Argo CD UI.
 canary-status-url: https://argo.diegovieira.app/rollouts/rollout/{namespace}/{rollout}
+
+# Minutes until the ephemeral environment (.github/workflows/ephemeral.yaml) is removed automatically
+# by .github/workflows/ephemeral-cleanup.yaml, unless its removal is approved earlier.
+ephemeral-ttl: 240

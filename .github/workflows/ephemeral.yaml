@@ -1,0 +1,205 @@
+name: ephemeral
+
+# Deploys canary-demo-ephemeral (one pod, no canary) next to the canary release. It is removed when
+# the ephemeral-removal environment is approved or, at the latest, when ephemeral-cleanup.yaml finds
+# its expiry (ephemeral-ttl in gha-config.yml) has passed.
+on:
+  workflow_dispatch:
+    inputs:
+      ttl:
+        description: Minutos até a remoção automática (vazio = ephemeral-ttl do gha-config.yml)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# A new deploy replaces the environment, so it cancels the previous run still waiting for removal.
+concurrency:
+  group: ephemeral
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/canary-demo
+  ARGOCD_VERSION: v2.9.7
+  ARGOCD_PROJECT: canary-demo
+  EPHEMERAL_APP: canary-demo-ephemeral
+  EPHEMERAL_NAMESPACE: app-canary
+  EPHEMERAL_LABEL: validation-projects/ephemeral
+  GITOPS_REPO: git@github.com:validation-projects/argo-gitops-repo.git
+  GITOPS_PATH: clusters/lab/app-canary-ephemeral
+
+jobs:
+  config:
+    name: Load ephemeral config
+    runs-on: ubuntu-26.04
+    outputs:
+      ttl: ${{ steps.config.outputs.ttl }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Instalar yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Ler gha-config.yml
+        id: config
+        env:
+          CONFIG_FILE: gha-config.yml
+          TTL_INPUT: ${{ inputs.ttl }}
+        run: |
+          ttl=""
+          if [ -f "$CONFIG_FILE" ]; then
+            ttl=$(yq '.["ephemeral-ttl"] // ""' "$CONFIG_FILE")
+          fi
+          ttl=${TTL_INPUT:-${ttl:-240}}
+          if ! [[ "$ttl" =~ ^[0-9]+$ ]] || (( 10#$ttl < 1 )); then
+            echo "::error file=$CONFIG_FILE::ephemeral-ttl deve ser um inteiro positivo (recebido: '$ttl')"
+            exit 1
+          fi
+          ttl=$(( 10#$ttl ))
+          echo "Tempo de vida do ambiente efêmero: ${ttl} min${TTL_INPUT:+ (input ttl)}"
+          echo "ttl=$ttl" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and publish image
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+          build-args: APP_VERSION=${{ steps.v.outputs.version }}
+
+  deploy:
+    name: Deploy ephemeral environment
+    needs: [config, build]
+    runs-on: ubuntu-26.04
+    env:
+      TTL: ${{ needs.config.outputs.ttl }}
+      VERSION: ${{ needs.build.outputs.version }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Criar ambiente efêmero
+        id: create
+        run: |
+          expires_at=$(date -u -d "+${TTL} minutes" +%Y-%m-%dT%H:%M:%SZ)
+          # The finalizer makes deleting the Application also delete its pods, Deployment and Service.
+          cat > "$RUNNER_TEMP/app.yaml" <<APP
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: $EPHEMERAL_APP
+            namespace: argocd
+            labels:
+              $EPHEMERAL_LABEL: "true"
+            annotations:
+              validation-projects/expires-at: "$expires_at"
+              validation-projects/run-id: "$GITHUB_RUN_ID"
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: $ARGOCD_PROJECT
+            source:
+              repoURL: $GITOPS_REPO
+              targetRevision: main
+              path: $GITOPS_PATH
+              kustomize:
+                images:
+                  - canary-demo=$IMAGE@$DIGEST
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: $EPHEMERAL_NAMESPACE
+          APP
+          argocd app create -f "$RUNNER_TEMP/app.yaml" --upsert --grpc-web
+          argocd app sync "$EPHEMERAL_APP" --grpc-web --prune --timeout 300
+          argocd app wait "$EPHEMERAL_APP" --grpc-web --health --timeout 300
+          echo "Ambiente $EPHEMERAL_APP no ar com a versão $VERSION; remoção automática em $expires_at"
+          echo "expires-at=$expires_at" >> "$GITHUB_OUTPUT"
+      - name: Resumo do ambiente efêmero
+        env:
+          EXPIRES_AT: ${{ steps.create.outputs.expires-at }}
+        run: |
+          {
+            echo "## Ambiente efêmero \`$EPHEMERAL_APP\` no ar"
+            echo ""
+            echo "Versão \`$VERSION\` no namespace \`$EPHEMERAL_NAMESPACE\`."
+            echo ""
+            echo "Removido automaticamente em **$EXPIRES_AT** (UTC, ${TTL} min)."
+            echo "Para remover antes, aprove o environment \`ephemeral-removal\` deste run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  remove:
+    name: Remove ephemeral environment
+    needs: [config, deploy]
+    runs-on: ubuntu-26.04
+    # Reviewers only, no wait timer: waiting for approval does not hold a runner.
+    environment: ephemeral-removal
+    env:
+      ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+    steps:
+      - name: Instalar CLI de deploy
+        run: |
+          curl -sSfL -o argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x argocd
+          sudo install -m 555 argocd /usr/local/bin/argocd
+      - name: Mascarar credenciais
+        run: echo "::add-mask::$ARGOCD_AUTH_TOKEN"
+      - name: Remover ambiente efêmero
+        run: |
+          find_app() {
+            argocd app list --grpc-web -p "$ARGOCD_PROJECT" -l "$EPHEMERAL_LABEL=true" -o json |
+              jq -c --arg name "$EPHEMERAL_APP" '.[]? | select(.metadata.name == $name)'
+          }
+          app=$(find_app)
+          owner=$(jq -r '.metadata.annotations["validation-projects/run-id"] // ""' <<<"${app:-null}")
+          if [ -z "$app" ]; then
+            result="Ambiente \`$EPHEMERAL_APP\` já tinha sido removido (expiração)."
+          elif [ "$owner" != "$GITHUB_RUN_ID" ]; then
+            result="Ambiente \`$EPHEMERAL_APP\` pertence a outro deploy (run $owner); nada removido."
+          else
+            argocd app delete "$EPHEMERAL_APP" --cascade -y --grpc-web
+            for i in $(seq 1 60); do
+              [ -z "$(find_app)" ] && break
+              sleep 5
+            done
+            if [ -n "$(find_app)" ]; then
+              echo "::error::Timeout aguardando a remoção de $EPHEMERAL_APP"
+              exit 1
+            fi
+            result="Ambiente \`$EPHEMERAL_APP\` removido antes da expiração."
+          fi
+          echo "$result"
+          { echo "## Ambiente efêmero removido"; echo ""; echo "$result"; } >> "$GITHUB_STEP_SUMMARY"
